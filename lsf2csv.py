@@ -37,8 +37,11 @@ Usage examples:
 
 import argparse
 import csv
+import json
 import math
+import sqlite3
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -73,119 +76,155 @@ def format_timestamp(ts: float, human: bool = False) -> str:
     return f"{ts:.6f}"
 
 
-def build_entity_map(lsf_path: Path, msg_defs: dict) -> dict[int, str]:
-    """Extract entity id -> label mapping from EntityInfo messages in the log."""
-    emap = {}
-    for msg in iter_packets(lsf_path, msg_defs, {"EntityInfo"}):
-        eid = msg.fields.get("id")
-        label = msg.fields.get("label", "")
-        if eid is not None and label:
-            emap[eid] = label
-    return emap
+def collect_field_keys_and_entities(lsf_path: Path, msg_defs: dict,
+                                    filter_abbrevs: set = None,
+                                    resolve_entities: bool = False,
+                                    ) -> tuple[dict[str, list[str]], dict[int, str], int]:
+    """
+    First pass: collect all unique field key names per message type
+    and optionally build the entity ID map.
+    Returns (field_keys_per_type, entity_map, total_message_count).
+    Memory: stores only field name sets (strings), not message payloads.
+    """
+    field_keys_per_type = {}
+    entity_map = {}
+    total = 0
 
+    for msg in iter_packets(lsf_path, msg_defs, filter_abbrevs, keep_raw=False):
+        total += 1
+        if resolve_entities and msg.abbrev == "EntityInfo":
+            eid = msg.fields.get("id")
+            label = msg.fields.get("label", "")
+            if eid is not None and label:
+                entity_map[eid] = label
 
-def collect_messages(lsf_path: Path, msg_defs: dict,
-                     filter_abbrevs: set = None) -> dict[str, list[IMCMessage]]:
-    """Read all packets and group by message abbreviation."""
-    by_type = defaultdict(list)
-    for msg in iter_packets(lsf_path, msg_defs, filter_abbrevs):
-        by_type[msg.abbrev].append(msg)
-    return by_type
-
-
-def write_csv(messages: list[IMCMessage], output_path: Path,
-              human_time: bool = False, entity_map: dict = None,
-              degrees: bool = False):
-    """Write a list of same-type IMCMessages to a CSV file."""
-    if not messages:
-        return
-
-    all_rows = []
-    all_field_keys = []
-    field_key_set = set()
-
-    for msg in messages:
+        if msg.abbrev not in field_keys_per_type:
+            field_keys_per_type[msg.abbrev] = {}
+        keys = field_keys_per_type[msg.abbrev]
         flat = flatten_fields(msg.fields)
-        if degrees:
-            for k in LAT_LON_FIELDS:
-                if k in flat and isinstance(flat[k], (int, float)):
-                    flat[k] = math.degrees(flat[k])
         for k in flat:
-            if k not in field_key_set:
-                field_key_set.add(k)
-                all_field_keys.append(k)
-        all_rows.append((msg, flat))
+            keys[k] = None  # dict preserves insertion order (Python 3.7+)
 
+    result = {abv: list(k.keys()) for abv, k in field_keys_per_type.items()}
+    return result, entity_map, total
+
+
+def _build_row(msg: IMCMessage, human_time: bool, entity_map: dict,
+               degrees: bool, include_msg_type: bool = False) -> dict:
+    """Build a CSV row dict from a decoded message."""
+    flat = flatten_fields(msg.fields)
+    if degrees:
+        for k in LAT_LON_FIELDS:
+            if k in flat and isinstance(flat[k], (int, float)):
+                flat[k] = math.degrees(flat[k])
+
+    row = {
+        "timestamp": format_timestamp(msg.header.timestamp, human_time),
+        "src": msg.header.src,
+        "src_ent": msg.header.src_ent,
+        "dst": msg.header.dst,
+        "dst_ent": msg.header.dst_ent,
+    }
+    if include_msg_type:
+        row["message_type"] = msg.abbrev
+    if entity_map:
+        row["src_ent_name"] = entity_map.get(msg.header.src_ent, "")
+        row["dst_ent_name"] = entity_map.get(msg.header.dst_ent, "")
+    row.update(flat)
+    return row
+
+
+def stream_write_csvs(lsf_path: Path, msg_defs: dict,
+                      field_keys_per_type: dict[str, list[str]],
+                      output_dir: Path, stem: str,
+                      human_time: bool = False, entity_map: dict = None,
+                      degrees: bool = False):
+    """
+    Second pass (non-merge): stream packets and write rows directly
+    to per-type CSV files.  Opens one file handle per message type.
+    Memory: one message at a time.
+    """
     header_cols = ["timestamp", "src", "src_ent", "dst", "dst_ent"]
     if entity_map:
         header_cols = ["timestamp", "src", "src_ent", "src_ent_name",
                        "dst", "dst_ent", "dst_ent_name"]
-    fieldnames = header_cols + all_field_keys
 
-    with open(output_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for msg, flat in all_rows:
-            row = {
-                "timestamp": format_timestamp(msg.header.timestamp, human_time),
-                "src": msg.header.src,
-                "src_ent": msg.header.src_ent,
-                "dst": msg.header.dst,
-                "dst_ent": msg.header.dst_ent,
-            }
-            if entity_map:
-                row["src_ent_name"] = entity_map.get(msg.header.src_ent, "")
-                row["dst_ent_name"] = entity_map.get(msg.header.dst_ent, "")
-            row.update(flat)
+    files = {}
+    writers = {}
+    row_counts = {}
+
+    try:
+        for abbrev, keys in field_keys_per_type.items():
+            out_path = output_dir / f"{stem}_{abbrev}.csv"
+            fieldnames = header_cols + keys
+            f = open(out_path, "w", newline="")
+            files[abbrev] = f
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writers[abbrev] = writer
+            row_counts[abbrev] = 0
+
+        for msg in iter_packets(lsf_path, msg_defs,
+                                set(field_keys_per_type), keep_raw=False):
+            writer = writers.get(msg.abbrev)
+            if writer is None:
+                continue
+            row = _build_row(msg, human_time, entity_map, degrees)
             writer.writerow(row)
+            row_counts[msg.abbrev] += 1
+
+    finally:
+        for f in files.values():
+            f.close()
+
+    for abbrev, count in row_counts.items():
+        out_path = output_dir / f"{stem}_{abbrev}.csv"
+        print(f"  -> {out_path}  ({count} rows)")
 
 
-def write_merged_csv(by_type: dict[str, list[IMCMessage]], output_path: Path,
-                     human_time: bool = False, entity_map: dict = None,
-                     degrees: bool = False):
-    """Merge multiple message types into a single CSV, sorted by timestamp."""
-    all_msgs = []
-    for msgs in by_type.values():
-        all_msgs.extend(msgs)
-    all_msgs.sort(key=lambda m: m.header.timestamp)
-
-    all_field_keys = []
-    field_key_set = set()
-    for msg in all_msgs:
-        flat = flatten_fields(msg.fields)
-        for k in flat:
-            if k not in field_key_set:
-                field_key_set.add(k)
-                all_field_keys.append(k)
-
+def stream_write_merged_csv(lsf_path: Path, msg_defs: dict,
+                            filter_abbrevs: set, all_field_keys: list[str],
+                            output_path: Path,
+                            human_time: bool = False, entity_map: dict = None,
+                            degrees: bool = False):
+    """
+    Second pass (merge): buffer rows in a temp sqlite3 database,
+    then read back sorted by timestamp and write the merged CSV.
+    Memory: one row at a time (sqlite3 handles the rest on disk).
+    """
     header_cols = ["timestamp", "message_type", "src", "src_ent", "dst", "dst_ent"]
     if entity_map:
         header_cols = ["timestamp", "message_type", "src", "src_ent",
                        "src_ent_name", "dst", "dst_ent", "dst_ent_name"]
     fieldnames = header_cols + all_field_keys
 
-    with open(output_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for msg in all_msgs:
-            flat = flatten_fields(msg.fields)
-            if degrees:
-                for k in LAT_LON_FIELDS:
-                    if k in flat and isinstance(flat[k], (int, float)):
-                        flat[k] = math.degrees(flat[k])
-            row = {
-                "timestamp": format_timestamp(msg.header.timestamp, human_time),
-                "message_type": msg.abbrev,
-                "src": msg.header.src,
-                "src_ent": msg.header.src_ent,
-                "dst": msg.header.dst,
-                "dst_ent": msg.header.dst_ent,
-            }
-            if entity_map:
-                row["src_ent_name"] = entity_map.get(msg.header.src_ent, "")
-                row["dst_ent_name"] = entity_map.get(msg.header.dst_ent, "")
-            row.update(flat)
-            writer.writerow(row)
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    try:
+        conn = sqlite3.connect(tmp.name)
+        conn.execute("CREATE TABLE msgs (ts REAL, data TEXT)")
+
+        for msg in iter_packets(lsf_path, msg_defs, filter_abbrevs, keep_raw=False):
+            row = _build_row(msg, human_time, entity_map, degrees,
+                             include_msg_type=True)
+            conn.execute("INSERT INTO msgs VALUES (?, ?)",
+                         (msg.header.timestamp, json.dumps(row)))
+
+        conn.commit()
+
+        with open(output_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            cursor = conn.execute("SELECT data FROM msgs ORDER BY ts")
+            written = 0
+            for (data_json,) in cursor:
+                writer.writerow(json.loads(data_json))
+                written += 1
+
+        print(f"  -> {output_path}  ({written} rows)")
+
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
 
 
 def list_message_types(lsf_path: Path, msg_defs: dict):
@@ -242,38 +281,47 @@ def find_lsf_files(directory: Path) -> list[Path]:
 
 
 def process_single_file(lsf_path: Path, msg_defs: dict, args) -> None:
-    """Process a single LSF file with the given arguments."""
+    """Process a single LSF file with the given arguments (two-pass streaming)."""
     t0 = time.monotonic()
 
-    entity_map = None
-    if args.resolve_entities:
-        entity_map = build_entity_map(lsf_path, msg_defs)
-
     filter_abbrevs = set(args.messages) if args.messages else None
-
     out_dir = args.output or lsf_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Reading {lsf_path} ...")
-    by_type = collect_messages(lsf_path, msg_defs, filter_abbrevs)
+    # ── Pass 1: collect field key names + entity map (lightweight) ──
+    print(f"Scanning {lsf_path} ...")
+    field_keys_per_type, entity_map, total_msgs = collect_field_keys_and_entities(
+        lsf_path, msg_defs, filter_abbrevs, args.resolve_entities,
+    )
     elapsed = time.monotonic() - t0
+    print(f"  Found {total_msgs} messages ({len(field_keys_per_type)} types) in {elapsed:.1f}s.")
 
-    total_msgs = sum(len(v) for v in by_type.values())
-    print(f"  Decoded {total_msgs} messages ({len(by_type)} types) in {elapsed:.1f}s.")
+    stem = lsf_path.stem.replace(".lsf", "")
+
+    # ── Pass 2: stream rows to CSV(s) ──
+    t1 = time.monotonic()
 
     if args.merge:
-        stem = lsf_path.stem.replace(".lsf", "")
+        all_keys = []
+        key_set = set()
+        for keys in field_keys_per_type.values():
+            for k in keys:
+                if k not in key_set:
+                    key_set.add(k)
+                    all_keys.append(k)
         out_path = out_dir / f"{stem}_merged.csv"
-        write_merged_csv(by_type, out_path, args.human_time, entity_map,
-                         args.degrees)
-        print(f"  -> {out_path}  ({total_msgs} rows)")
+        stream_write_merged_csv(
+            lsf_path, msg_defs, set(field_keys_per_type), all_keys,
+            out_path, args.human_time, entity_map, args.degrees,
+        )
     else:
-        for abbrev, msgs in sorted(by_type.items()):
-            stem = lsf_path.stem.replace(".lsf", "")
-            out_path = out_dir / f"{stem}_{abbrev}.csv"
-            write_csv(msgs, out_path, args.human_time, entity_map,
-                      args.degrees)
-            print(f"  -> {out_path}  ({len(msgs)} rows)")
+        stream_write_csvs(
+            lsf_path, msg_defs, field_keys_per_type,
+            out_dir, stem, args.human_time, entity_map, args.degrees,
+        )
+
+    write_elapsed = time.monotonic() - t1
+    print(f"  Wrote {total_msgs} rows in {write_elapsed:.1f}s.")
 
 
 def main():

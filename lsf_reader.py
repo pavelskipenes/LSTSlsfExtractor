@@ -20,6 +20,7 @@ Header layout (little-endian when sync == 0xFE54):
 """
 
 import gzip
+import mmap
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,8 @@ FOOTER_SIZE = 2
 
 STRUCT_FMT_LE = "<HHHdHBHB"
 STRUCT_FMT_BE = ">HHHdHBHB"
+
+_CHUNK_SIZE = 1 * 1024 * 1024  # 1 MiB read chunks for gzip streaming
 
 
 @dataclass
@@ -151,40 +154,13 @@ def _deserialize_fields(buf: bytes, offset: int, field_defs: list[FieldDef],
     return result, offset
 
 
-def _open_lsf(path: Path) -> BinaryIO:
-    """Open an LSF file, auto-detecting gzip compression."""
-    if path.suffix == ".gz" or path.suffixes[-2:] == [".lsf", ".gz"]:
-        return gzip.open(path, "rb")
-    return open(path, "rb")
-
-
-def iter_packets(path: Path, msg_defs: dict[int, MessageDef],
-                 filter_abbrevs: Optional[set[str]] = None,
-                 ) -> Iterator[IMCMessage]:
-    """
-    Iterate over all IMC packets in an LSF file.
-
-    Parameters
-    ----------
-    path : Path to .lsf or .lsf.gz file
-    msg_defs : message definitions from parse_imc_xml()
-    filter_abbrevs : if set, only yield messages whose abbrev is in this set
-    """
-    filter_ids = None
-    if filter_abbrevs:
-        filter_ids = {mid for mid, mdef in msg_defs.items()
-                      if mdef.abbrev in filter_abbrevs}
-
-    with _open_lsf(path) as f:
-        buf = f.read()
-
+def _consume_packets(buf: bytes, filter_ids, msg_defs, keep_raw):
+    """Extract all complete packets from a buffer, return (packets, remainder)."""
+    packets = []
     offset = 0
     length = len(buf)
 
     while offset + HEADER_SIZE + FOOTER_SIZE <= length:
-        if offset + 2 > length:
-            break
-
         raw_sync = struct.unpack_from("<H", buf, offset)[0]
         if raw_sync == SYNC_LE:
             hdr_fmt = STRUCT_FMT_LE
@@ -196,9 +172,6 @@ def iter_packets(path: Path, msg_defs: dict[int, MessageDef],
             offset += 1
             continue
 
-        if offset + HEADER_SIZE > length:
-            break
-
         vals = struct.unpack_from(hdr_fmt, buf, offset)
         hdr = PacketHeader(*vals)
 
@@ -206,9 +179,7 @@ def iter_packets(path: Path, msg_defs: dict[int, MessageDef],
         if packet_end > length:
             break
 
-        payload_start = offset + HEADER_SIZE
-        payload_bytes = buf[payload_start:payload_start + hdr.size]
-
+        payload_bytes = buf[offset + HEADER_SIZE:offset + HEADER_SIZE + hdr.size]
         offset = packet_end
 
         if filter_ids is not None and hdr.mgid not in filter_ids:
@@ -218,13 +189,120 @@ def iter_packets(path: Path, msg_defs: dict[int, MessageDef],
         if mdef is None:
             continue
 
-        fields, _ = _deserialize_fields(payload_bytes, 0, mdef.fields,
-                                         unpack, msg_defs)
+        fields, _ = _deserialize_fields(payload_bytes, 0, mdef.fields, unpack, msg_defs)
+        packets.append(IMCMessage(
+            header=hdr, fields=fields, abbrev=mdef.abbrev,
+            name=mdef.name, raw_payload=payload_bytes if keep_raw else b"",
+        ))
 
-        yield IMCMessage(
-            header=hdr,
-            fields=fields,
-            abbrev=mdef.abbrev,
-            name=mdef.name,
-            raw_payload=payload_bytes,
-        )
+    return packets, buf[offset:]
+
+
+def _open_lsf(path: Path) -> BinaryIO:
+    """Open an LSF file, auto-detecting gzip compression."""
+    if path.suffix == ".gz" or path.suffixes[-2:] == [".lsf", ".gz"]:
+        return gzip.open(path, "rb")
+    return open(path, "rb")
+
+
+def iter_packets(path: Path, msg_defs: dict[int, MessageDef],
+                 filter_abbrevs: Optional[set[str]] = None,
+                 keep_raw: bool = False,
+                 ) -> Iterator[IMCMessage]:
+    """
+    Iterate over all IMC packets in an LSF file.
+
+    Parameters
+    ----------
+    path : Path to .lsf or .lsf.gz file
+    msg_defs : message definitions from parse_imc_xml()
+    filter_abbrevs : if set, only yield messages whose abbrev is in this set
+    keep_raw : if True, store raw payload bytes in IMCMessage (default: False)
+    """
+    filter_ids = None
+    if filter_abbrevs:
+        filter_ids = {mid for mid, mdef in msg_defs.items()
+                      if mdef.abbrev in filter_abbrevs}
+
+    def _process_buf(buf: bytes):
+        offset = 0
+        length = len(buf)
+        while offset + HEADER_SIZE + FOOTER_SIZE <= length:
+            if offset + 2 > length:
+                break
+
+            raw_sync = struct.unpack_from("<H", buf, offset)[0]
+            if raw_sync == SYNC_LE:
+                hdr_fmt = STRUCT_FMT_LE
+                unpack = _UNPACK_LE
+            elif raw_sync == SYNC_BE:
+                hdr_fmt = STRUCT_FMT_BE
+                unpack = _UNPACK_BE
+            else:
+                offset += 1
+                continue
+
+            if offset + HEADER_SIZE > length:
+                break
+
+            vals = struct.unpack_from(hdr_fmt, buf, offset)
+            hdr = PacketHeader(*vals)
+
+            packet_end = offset + HEADER_SIZE + hdr.size + FOOTER_SIZE
+            if packet_end > length:
+                break
+
+            payload_bytes = buf[offset + HEADER_SIZE:offset + HEADER_SIZE + hdr.size]
+            offset = packet_end
+
+            if filter_ids is not None and hdr.mgid not in filter_ids:
+                continue
+
+            mdef = msg_defs.get(hdr.mgid)
+            if mdef is None:
+                continue
+
+            fields, _ = _deserialize_fields(payload_bytes, 0, mdef.fields,
+                                             unpack, msg_defs)
+
+            yield IMCMessage(
+                header=hdr,
+                fields=fields,
+                abbrev=mdef.abbrev,
+                name=mdef.name,
+                raw_payload=payload_bytes if keep_raw else b"",
+            )
+
+    def _stream_from_gzip(f: BinaryIO):
+        """Stream-process a gzipped LSF file in chunks, yielding complete packets."""
+        buf = b""
+        while True:
+            chunk = f.read(_CHUNK_SIZE)
+            if not chunk:
+                break
+            buf += chunk
+            # Extract all complete packets from the buffer
+            consumed = _consume_packets(buf, filter_ids, msg_defs, keep_raw)
+            for pkt in consumed[0]:
+                yield pkt
+            buf = consumed[1]
+
+        # Final pass on remaining data
+        for pkt in _consume_packets(buf, filter_ids, msg_defs, keep_raw)[0]:
+            yield pkt
+
+    with _open_lsf(path) as f:
+        # Plain files: mmap for zero-copy access
+        if path.suffix != ".gz":
+            try:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as buf:
+                    yield from _process_buf(buf)
+                return
+            except (OSError, ValueError):
+                pass
+            f.seek(0)
+            yield from _process_buf(f.read())
+            return
+
+        # Gzip files: streaming to keep memory bounded
+        yield from _stream_from_gzip(f)
